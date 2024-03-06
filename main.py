@@ -1,3 +1,10 @@
+import sys
+import warnings
+
+# Отключение всех предупреждений
+warnings.filterwarnings("ignore")
+############################################
+
 import torch
 import torch.nn as nn
 import gdown
@@ -12,16 +19,27 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 import sacrebleu
 import re
+import math
 from torch.utils.data import TensorDataset, DataLoader
-
+import random
 #################################################################
 
 #parameters
 
 NUM_EPOCHS = 30
-hidden_size = 256
-batch_size = 64
 MIN_FREQENCY = 20
+
+torch.manual_seed(0)
+
+SRC_VOCAB_SIZE = 0
+TGT_VOCAB_SIZE = 0
+
+EMB_SIZE = 512
+NHEAD = 8
+FFN_HID_DIM = 512
+BATCH_SIZE = 128
+NUM_ENCODER_LAYERS = 3
+NUM_DECODER_LAYERS = 3
 
 ###################################################################
 
@@ -30,6 +48,7 @@ MAX_LEN = 100
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SOS_TOKEN_ENG = 2
 EOS_TOKEN_ENG = 3
+PAD_TOKEN_ENG = 0
 
 # сделано на основе туториала
 # https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html
@@ -39,8 +58,8 @@ def dataset_iterator(texts):
     # also normalize data
     for text in texts:
         text = text.lower().strip()
-        text = re.sub(r"([.!?])", r" \1", text)
-        text = re.sub(r"[^a-zA-Z!?]+", r" ", text)
+        # text = re.sub(r"([.!?])", r" \1", text)
+        # text = re.sub(r"[^a-zA-Z!?]+", r" ", text)
         yield text.strip().split()
 
 def create_tokenized_data(texts, vocab):
@@ -54,194 +73,235 @@ def create_tokenized_data(texts, vocab):
         tokenized[i, :min(MAX_LEN, len(tokens))] = torch.tensor(tokens[:min(MAX_LEN, len(tokens))])
     return tokenized
 
-class EncoderRNN(nn.Module):
-    def __init__(self, input_size, hidden_size, dropout_p=0.1):
-        super(EncoderRNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True, num_layers=1)
-        self.dropout = nn.Dropout(dropout_p)
+class PositionalEncoding(nn.Module):
+    def __init__(self,
+                 emb_size: int,
+                 dropout: float,
+                 maxlen: int = 5000):
+        super(PositionalEncoding, self).__init__()
+        den = torch.exp(- torch.arange(0, emb_size, 2)* math.log(10000) / emb_size)
+        pos = torch.arange(0, maxlen).reshape(maxlen, 1)
+        pos_embedding = torch.zeros((maxlen, emb_size))
+        pos_embedding[:, 0::2] = torch.sin(pos * den)
+        pos_embedding[:, 1::2] = torch.cos(pos * den)
+        pos_embedding = pos_embedding.unsqueeze(-2)
 
-    def forward(self, input):
-        embedded = self.dropout(self.embedding(input))
-        output, hidden = self.gru(embedded)
-        return output, hidden
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer('pos_embedding', pos_embedding)
 
-class BahdanauAttention(nn.Module):
-    def __init__(self, hidden_size):
-        super(BahdanauAttention, self).__init__()
-        self.Wa = nn.Linear(hidden_size, hidden_size)
-        self.Ua = nn.Linear(hidden_size, hidden_size)
-        self.Va = nn.Linear(hidden_size, 1)
+    def forward(self, token_embedding):
+        # print(token_embedding.shape)
+        # print(self.pos_embedding.shape)
+        # print(self.pos_embedding[:token_embedding.size(1), :].transpose(0,1).shape)
+        return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(1), :].transpose(0,1))
 
-    def forward(self, query, keys):
-        scores = self.Va(torch.tanh(self.Wa(query) + self.Ua(keys)))
-        scores = scores.squeeze(2).unsqueeze(1)
+# helper Module to convert tensor of input indices into corresponding tensor of token embeddings
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, emb_size):
+        super(TokenEmbedding, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_size)
+        self.emb_size = emb_size
 
-        weights = nn.functional.softmax(scores, dim=-1)
-        context = torch.bmm(weights, keys)
+    def forward(self, tokens):
+        return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
 
-        return context, weights
+# Seq2Seq Network
+class Seq2SeqTransformer(nn.Module):
+    def __init__(self,
+                 num_encoder_layers: int,
+                 num_decoder_layers: int,
+                 emb_size: int,
+                 nhead: int,
+                 src_vocab_size: int,
+                 tgt_vocab_size: int,
+                 dim_feedforward: int = 512,
+                 dropout: float = 0.1):
+        super(Seq2SeqTransformer, self).__init__()
+        self.transformer = nn.Transformer(d_model=emb_size,
+                                       nhead=nhead,
+                                       num_encoder_layers=num_encoder_layers,
+                                       num_decoder_layers=num_decoder_layers,
+                                       dim_feedforward=dim_feedforward,
+                                       dropout=dropout,
+                                       batch_first=True)
+        self.generator = nn.Linear(emb_size, tgt_vocab_size)
+        self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
+        self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
+        self.positional_encoding = PositionalEncoding(
+            emb_size, dropout=dropout)
 
-class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size, dropout_p=0.1):
-        super(DecoderRNN, self).__init__()
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.attention = BahdanauAttention(hidden_size)
-        self.gru = nn.GRU(2 * hidden_size, hidden_size, batch_first=True)
-        self.out = nn.Linear(hidden_size, output_size)
-        self.dropout = nn.Dropout(dropout_p)
+    def forward(self, src, trg, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask, memory_key_padding_mask):
+        src_emb = self.positional_encoding(self.src_tok_emb(src))
+        tgt_emb = self.positional_encoding(self.tgt_tok_emb(trg))
+        outs = self.transformer(src_emb, tgt_emb, src_mask, tgt_mask, None,
+                                src_padding_mask, tgt_padding_mask, memory_key_padding_mask)
+        return self.generator(outs)
 
-    def forward(self, encoder_outputs, encoder_hidden, target_tensor=None):
-        batch_size = encoder_outputs.size(0)
-        decoder_input = torch.empty(batch_size, 1, dtype=torch.long, device=device).fill_(SOS_TOKEN_ENG)
-        decoder_hidden = encoder_hidden
-        decoder_outputs = []
-        attentions = []
+    def encode(self, src, src_mask, src_mask_pad):
+        return self.transformer.encoder(self.positional_encoding(
+                            self.src_tok_emb(src)), src_mask, src_mask_pad)
 
-        for i in range(MAX_LEN):
-            decoder_output, decoder_hidden, attn_weights = self.forward_step(
-                decoder_input, decoder_hidden, encoder_outputs
-            )
-            decoder_outputs.append(decoder_output)
-            attentions.append(attn_weights)
+    def decode(self, tgt, memory, tgt_mask):
+        return self.transformer.decoder(self.positional_encoding(
+                          self.tgt_tok_emb(tgt)), memory,
+                          tgt_mask)
 
-            if target_tensor is not None:
-                # Teacher forcing: Feed the target as the next input
-                decoder_input = target_tensor[:, i].unsqueeze(1) # Teacher forcing
-            else:
-                # Without teacher forcing: use its own predictions as the next input
-                _, topi = decoder_output.topk(1)
-                decoder_input = topi.squeeze(-1).detach()  # detach from history as input
-
-        decoder_outputs = torch.cat(decoder_outputs, dim=1)
-        decoder_outputs = nn.functional.log_softmax(decoder_outputs, dim=-1)
-        attentions = torch.cat(attentions, dim=1)
-
-        return decoder_outputs, decoder_hidden, attentions
-
-
-    def forward_step(self, input, hidden, encoder_outputs):
-        embedded =  self.dropout(self.embedding(input))
-
-        query = hidden.permute(1, 0, 2)
-        context, attn_weights = self.attention(query, encoder_outputs)
-        input_gru = torch.cat((embedded, context), dim=2)
-
-        output, hidden = self.gru(input_gru, hidden)
-        output = self.out(output)
-
-        return output, hidden, attn_weights
+def generate_square_subsequent_mask(sz):
+    mask = (torch.triu(torch.ones((sz, sz), device=device)) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    return mask
 
 
-def train_epoch(dataloader, encoder, decoder, encoder_optimizer,
-          decoder_optimizer, criterion):
+def create_mask(src, tgt):
+    src_seq_len = src.shape[1]
+    tgt_seq_len = tgt.shape[1]
 
+    tgt_mask = generate_square_subsequent_mask(tgt_seq_len)
+    src_mask = torch.zeros((src_seq_len, src_seq_len),device=device).type(torch.bool)
+
+    # src_padding_mask = (src == PAD_TOKEN_ENG).transpose(0, 1)
+    # tgt_padding_mask = (tgt == PAD_TOKEN_ENG).transpose(0, 1)
+    src_padding_mask = (src == PAD_TOKEN_ENG)
+    tgt_padding_mask = (tgt == PAD_TOKEN_ENG)
+    return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
+
+def train_epoch(dataloader, model, optimizer, criterion):
+    model.train()
     total_loss = 0
     for data in tqdm(dataloader):
         input_tensor, target_tensor = data
         input_tensor = input_tensor.to(device)
         target_tensor = target_tensor.to(device)
-        encoder_optimizer.zero_grad()
-        decoder_optimizer.zero_grad()
 
-        encoder_outputs, encoder_hidden = encoder(input_tensor)
-        decoder_outputs, _, _ = decoder(encoder_outputs, encoder_hidden, target_tensor)
+        tgt_input = target_tensor[:, :-1]
+        src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(input_tensor, tgt_input)
 
-        loss = criterion(
-            decoder_outputs.view(-1, decoder_outputs.size(-1)),
-            target_tensor.long().view(-1)
-        )
+        optimizer.zero_grad()
+
+        logits = model(src=input_tensor, trg=tgt_input, src_mask=src_mask, tgt_mask=tgt_mask,src_padding_mask = src_padding_mask, tgt_padding_mask=tgt_padding_mask, memory_key_padding_mask=src_padding_mask)
+
+#         print(torch.max(logits[0], dim = 1)[1])
+
+        tgt_out = target_tensor[:, 1:]
+        loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1).long())
         loss.backward()
 
-        encoder_optimizer.step()
-        decoder_optimizer.step()
+        optimizer.step()
 
         total_loss += loss.item()
 
     return total_loss / len(dataloader)
 
-def validate(dataloader, encoder, decoder, vocab_out):
+def validate(dataloader, val_answers, model, vocab_out):
+    model.eval()
     with torch.no_grad():
-        decoded_words_init = []
         decoded_words_received = []
         for data in tqdm(dataloader):
             input_tensor, target_tensor = data
             input_tensor = input_tensor.to(device)
             target_tensor = target_tensor.to(device)
+            lengths = torch.count_nonzero(input_tensor, dim=1)
+#             print("lengths", lengths.shape)
+            src = input_tensor
+            num_tokens = src.shape[1]
+            src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool).to(device)
+            src_mask_pad = (src == PAD_TOKEN_ENG).type(torch.bool).to(device)
+            memory = model.encode(src, src_mask, src_mask_pad)
 
-            encoder_outputs, encoder_hidden = encoder(input_tensor)
-            decoder_outputs, decoder_hidden, decoder_attn = decoder(encoder_outputs, encoder_hidden)
-
-            _, topi = decoder_outputs.topk(1)
-            decoded_ids = topi.squeeze()
-            for decoded_sent in target_tensor:
+            ys = torch.ones(src.shape[0], 1).fill_(SOS_TOKEN_ENG).type(torch.long).to(device)
+            for i in range(MAX_LEN):
+                memory = memory.to(device)
+                tgt_mask = (generate_square_subsequent_mask(ys.size(1))
+                            .type(torch.bool)).to(device)
+                out = model.decode(ys, memory, tgt_mask)
+                prob = model.generator(out[:, -1])
+#                 print(prob.shape)
+#                 print(prob[0])
+                _, next_words = torch.max(prob, dim=1)
+#                 print(next_words.shape)
+                next_words = next_words.unsqueeze(0).transpose(0,1)
+                ys = torch.cat([ys, next_words], dim=1)
+#             print(ys)
+#             print(EOS_TOKEN_ENG)
+#             print(torch.sum(ys==EOS_TOKEN_ENG))
+            i = 0
+            for decoded_sent in ys:
                 decoded_words = []
                 for idx in decoded_sent[1:]:
                     if idx.item() == EOS_TOKEN_ENG:
+#                         print("hi")
                         break
                     decoded_words.append(vocab_out.lookup_token(idx.item()))
-                decoded_words_init.append(' '.join(decoded_words))
-            for decoded_sent in decoded_ids:
-                decoded_words = []
-                for idx in decoded_sent[1:]:
-                    if idx.item() == EOS_TOKEN_ENG:
-                        break
-                    decoded_words.append(vocab_out.lookup_token(idx.item()))
-                decoded_words_received.append(' '.join(decoded_words))
+                decoded_words_received.append(' '.join(decoded_words[:lengths[i]+5]))
+                i += 1
     print("Val example:")
-    print("target:", decoded_words_init[0])
-    print("received:", decoded_words_received[0])
-    bleu = sacrebleu.corpus_bleu(decoded_words_received, [decoded_words_init]).score
+    i = random.randint(0, BATCH_SIZE - 3)
+    print("target:", val_answers[i][:-1])
+    print("received:", decoded_words_received[i])
+    bleu = sacrebleu.corpus_bleu(decoded_words_received, [val_answers]).score
     return bleu
 
-def predict(dataloader, encoder, decoder, vocab_out):
+def predict(dataloader, model, vocab_out):
+    model.eval()
     decoded_words_received = []
     with torch.no_grad():
-        for input_tensor in tqdm(dataloader):
-            input_tensor = input_tensor[0].to(device)
+        for data in tqdm(dataloader):
+            input_tensor = data[0]
+            input_tensor = input_tensor.to(device)
+            lengths = torch.count_nonzero(input_tensor, dim=1)
+            src = input_tensor
+            num_tokens = src.shape[1]
+            src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool).to(device)
+            src_mask_pad = (src == PAD_TOKEN_ENG).type(torch.bool).to(device)
 
-            encoder_outputs, encoder_hidden = encoder(input_tensor)
-            decoder_outputs, decoder_hidden, decoder_attn = decoder(encoder_outputs, encoder_hidden)
-
-            _, topi = decoder_outputs.topk(1)
-            decoded_ids = topi.squeeze()
-            for decoded_sent in decoded_ids:
+            memory = model.encode(src, src_mask, src_mask_pad)
+            ys = torch.ones(src.shape[0], 1).fill_(SOS_TOKEN_ENG).type(torch.long).to(device)
+            for i in range(MAX_LEN):
+                memory = memory.to(device)
+                tgt_mask = (generate_square_subsequent_mask(ys.size(1))
+                            .type(torch.bool)).to(device)
+                out = model.decode(ys, memory, tgt_mask)
+                prob = model.generator(out[:, -1])
+                _, next_words = torch.max(prob, dim=1)
+                next_words = next_words.unsqueeze(0).transpose(0,1)
+                ys = torch.cat([ys, next_words], dim=1)
+            i = 0
+            for decoded_sent in ys:
                 decoded_words = []
                 for idx in decoded_sent[1:]:
                     if idx.item() == EOS_TOKEN_ENG:
                         break
                     decoded_words.append(vocab_out.lookup_token(idx.item()))
-                decoded_words_received.append(' '.join(decoded_words))
+                decoded_words_received.append(' '.join(decoded_words[:lengths[i]+5]))
+                i+= 1
     return decoded_words_received
 
 
-def train(train_dataloader, val_dataloader, test_loader, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, n_epochs, vocab_out, print_every=5):
+def train(train_dataloader, val_dataloader, val_answers, test_loader, model, optimizer, scheduler, criterion, n_epochs, vocab_out, vocab_in, print_every=5):
     print_loss_total = 0
 
     for epoch in range(1, n_epochs + 1):
         print(epoch)
-        loss = train_epoch(train_dataloader, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion)
+        loss = train_epoch(train_dataloader, model, optimizer, criterion)
         print_loss_total += loss
-        plot_loss_total += loss
-
+        scheduler.step()
         if epoch % print_every == 0:
             print_loss_avg = print_loss_total / print_every
             print_loss_total = 0
             print("loss train:", print_loss_avg)
-            bleu = validate(val_dataloader, encoder, decoder, vocab_out)
+            bleu = validate(val_dataloader, val_answers, model, vocab_out)
             print("val bleu:", bleu)
-        
+
+        print(predict_one("vielen dank .", model, vocab_in, vocab_out))
         print("Predicting...")
-        translates = predict(test_loader, encoder, decoder, vocab_out)
+        translates = predict(test_loader, model, vocab_out)
         translates = remove_consecutive_duplicates(translates)
         file_name = "answer" + str(epoch) +".txt"
         with open(file_name, 'w') as answer_file:
             for line in translates:
-                answer_file.write(line + "\n")    
+                answer_file.write(line + "\n")
         print("Predictions saved")
-        torch.save(encoder.state_dict(), 'weights/encoder_' + str(epoch) +'.pt')
-        torch.save(decoder.state_dict(), 'weights/decoder_' + str(epoch) +'.pt')
+        torch.save(model.state_dict(), 'weights/model_' + str(epoch) +'.pt')
 
 def remove_consecutive_duplicates(lines):
     filtered_lines = []
@@ -255,6 +315,43 @@ def remove_consecutive_duplicates(lines):
         filtered_lines.append(filtered_line)
     return filtered_lines
 
+
+def predict_one(sent, model, vocab_in, vocab_out):
+    sent_tokens = create_tokenized_data([sent], vocab_in)
+    model.eval()
+    decoded_words_received = []
+    with torch.no_grad():
+        input_tensor = sent_tokens.clone()
+        input_tensor = input_tensor.to(device)
+        lengths = torch.count_nonzero(input_tensor, dim=1)
+        src = input_tensor
+        num_tokens = src.shape[1]
+        src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool).to(device)
+        src_mask_pad = (src == PAD_TOKEN_ENG).type(torch.bool).to(device)
+
+        memory = model.encode(src, src_mask, src_mask_pad)
+        ys = torch.ones(src.shape[0], 1).fill_(SOS_TOKEN_ENG).type(torch.long).to(device)
+        for i in range(MAX_LEN):
+            memory = memory.to(device)
+            tgt_mask = (generate_square_subsequent_mask(ys.size(1))
+                        .type(torch.bool)).to(device)
+            out = model.decode(ys, memory, tgt_mask)
+            prob = model.generator(out[:, -1])
+            _, next_words = torch.max(prob, dim=1)
+            next_words = next_words.unsqueeze(0).transpose(0,1)
+            ys = torch.cat([ys, next_words], dim=1)
+        i = 0
+        for decoded_sent in ys:
+            decoded_words = []
+            for idx in decoded_sent[1:]:
+                if idx.item() == EOS_TOKEN_ENG:
+                    break
+                decoded_words.append(vocab_out.lookup_token(idx.item()))
+            decoded_words_received.append(' '.join(decoded_words[:lengths[i] + 5]))
+            i += 1
+    return decoded_words_received
+
+
 def main():
     print("Device:", device)
 
@@ -263,11 +360,11 @@ def main():
         url = 'https://drive.google.com/uc?id=1_TGzGyCNcozHYUXPzniR9D4GGZbD43X2'
         output = 'data.zip'
         gdown.download(url, output, quiet=False)
-        zip_file_path = 'data.zip'
-        extract_to_folder = 'data'
-        os.makedirs(extract_to_folder, exist_ok=True)
-        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_to_folder)
+    zip_file_path = 'data.zip'
+    extract_to_folder = 'data'
+    os.makedirs(extract_to_folder, exist_ok=True)
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_to_folder)
     train_de = open('data/data/train.de-en.de').readlines()
     train_en = open('data/data/train.de-en.en').readlines()
     val_de = open('data/data/val.de-en.de').readlines()
@@ -285,7 +382,7 @@ def main():
     )
     SOS_TOKEN_ENG = vocab_en['<sos>']
     EOS_TOKEN_ENG = vocab_en['<eos>']
-
+    PAD_TOKEN_ENG = vocab_en['<pad>']
     tokenized_train_de = create_tokenized_data(train_de, vocab_de)
     tokenized_train_en = create_tokenized_data(train_en, vocab_en)
     tokenized_val_de = create_tokenized_data(val_de, vocab_de)
@@ -296,28 +393,41 @@ def main():
     val_dataset = TensorDataset(tokenized_val_de, tokenized_val_en)
     test_dataset = TensorDataset(tokenized_test_de)
 
-    
 
-    train_loader = DataLoader(train_dataset, batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
+    train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_dataset, BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_dataset, BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
     print("Prepared")
 
-    encoder = EncoderRNN(len(vocab_de), hidden_size).to(device)
-    decoder = DecoderRNN(hidden_size, len(vocab_en)).to(device)
-    encoder_optimizer = torch.optim.Adam(encoder.parameters(), lr=0.001)
-    decoder_optimizer = torch.optim.Adam(decoder.parameters(), lr=0.001)
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    SRC_VOCAB_SIZE = len(vocab_de)
+    TGT_VOCAB_SIZE = len(vocab_en)
+
+    transformer = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, EMB_SIZE,
+                                 NHEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, FFN_HID_DIM)
+    for p in transformer.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+
+    transformer = transformer.to(device)
+
+    optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0004, betas=(0.9, 0.98), eps=1e-9)
+    scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ENG)
+    if not os.path.exists("weights/"):
+        os.makedirs("weights/")
+
+
     print("Training...")
-    train(train_loader, val_loader, test_loader, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, NUM_EPOCHS, vocab_en, print_every=1, plot_every=10)
+    train(train_loader, val_loader, val_en, test_loader, transformer, optimizer, scheduler, criterion, NUM_EPOCHS, vocab_en, vocab_de, print_every=1)
     print("Trained")
 
     print("Predicting...")
-    translates = predict(test_loader, encoder, decoder, vocab_en)
+    translates = predict(test_loader, transformer, vocab_en)
     translates = remove_consecutive_duplicates(translates)
     with open('final_answer.txt', 'w') as answer_file:
         for line in translates:
-            answer_file.write(line + "\n")    
+            answer_file.write(line + "\n")
     print("Predictions saved")
 
 main()
