@@ -1,8 +1,4 @@
 import sys
-import warnings
-
-# Отключение всех предупреждений
-warnings.filterwarnings("ignore")
 ############################################
 
 import torch
@@ -36,7 +32,7 @@ TGT_VOCAB_SIZE = 0
 
 EMB_SIZE = 512
 NHEAD = 8
-FFN_HID_DIM = 512
+FFN_HID_DIM = 1024
 BATCH_SIZE = 128
 NUM_ENCODER_LAYERS = 3
 NUM_DECODER_LAYERS = 3
@@ -72,6 +68,35 @@ def create_tokenized_data(texts, vocab):
     for i, tokens in enumerate(train_tokens):
         tokenized[i, :min(MAX_LEN, len(tokens))] = torch.tensor(tokens[:min(MAX_LEN, len(tokens))])
     return tokenized
+
+class NoiseDataset(TensorDataset):
+    def __init__(self, src_texts, tgt_texts, vocab_src, noise_level=0.1, p=0.1):
+        self.src_texts = src_texts
+        self.tgt_texts = tgt_texts
+        self.noise_level = noise_level
+        self.p = p
+        self.tokens = list(vocab_src.get_stoi().values())
+        super().__init__()
+
+    def add_noise_to_text(self, text_tensor):
+        # print(text_tensor)
+        num_noise_chars = math.ceil(text_tensor.shape[0] * self.noise_level)
+        for _ in range(num_noise_chars):
+            index = random.randint(0, text_tensor.shape[0] - 1)
+            # print(text_tensor.shape)
+            text_tensor[index] = self.tokens[random.randint(0,len(self.tokens) - 1)]
+        return text_tensor
+
+    def __getitem__(self, idx):
+        src_text = self.src_texts[idx]
+        tgt_text = self.tgt_texts[idx]
+        if random.random() < self.p:
+          src_text = self.add_noise_to_text(src_text)
+
+        return src_text, tgt_text
+
+    def __len__(self):
+        return len(self.src_texts)
 
 class PositionalEncoding(nn.Module):
     def __init__(self,
@@ -360,11 +385,11 @@ def main():
         url = 'https://drive.google.com/uc?id=1_TGzGyCNcozHYUXPzniR9D4GGZbD43X2'
         output = 'data.zip'
         gdown.download(url, output, quiet=False)
-    zip_file_path = 'data.zip'
-    extract_to_folder = 'data'
-    os.makedirs(extract_to_folder, exist_ok=True)
-    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_to_folder)
+        zip_file_path = 'data.zip'
+        extract_to_folder = 'data'
+        os.makedirs(extract_to_folder, exist_ok=True)
+        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to_folder)
     train_de = open('data/data/train.de-en.de').readlines()
     train_en = open('data/data/train.de-en.en').readlines()
     val_de = open('data/data/val.de-en.de').readlines()
@@ -389,7 +414,7 @@ def main():
     tokenized_val_en = create_tokenized_data(val_en, vocab_en)
     tokenized_test_de = create_tokenized_data(test_de, vocab_de)
 
-    train_dataset = TensorDataset(tokenized_train_de, tokenized_train_en)
+    train_dataset = NoiseDataset(tokenized_train_de, tokenized_train_en, vocab_de)
     val_dataset = TensorDataset(tokenized_val_de, tokenized_val_en)
     test_dataset = TensorDataset(tokenized_test_de)
 
@@ -412,7 +437,7 @@ def main():
     transformer = transformer.to(device)
 
     optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0004, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
+    scheduler = StepLR(optimizer, step_size=4, gamma=0.5)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ENG)
     if not os.path.exists("weights/"):
         os.makedirs("weights/")
