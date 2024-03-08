@@ -358,17 +358,28 @@ def train(train_dataloader, val_dataloader, val_answers, test_loader, model, opt
                 answer_file.write(line + "\n")
         print("Predictions saved")
         torch.save(model.state_dict(), 'weights/model_' + str(epoch) +'.pt')
-    # Plotting and saving the graph
-    plt.figure(figsize=(10, 5))
-    plt.plot(range(1, n_epochs + 1), losses, label='train Loss')
-    plt.plot(range(1, n_epochs + 1), bleus, label='val BLEU Score')
-    plt.xlabel('Epoch')
-    plt.ylabel('Value')
-    plt.title('Training Loss and val BLEU Score')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('loss_bleu_plot.png')
-    plt.show()
+        
+        # График для лосса
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(1, epoch + 1), losses, label='Train Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss Value')
+        plt.title('Training Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig('train_loss_plot_'+ str(epoch) + '.png')
+        plt.show()
+
+        # График для BLEU Score
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(1, epoch + 1), bleus, label='Val BLEU Score')
+        plt.xlabel('Epoch')
+        plt.ylabel('BLEU Score Value')
+        plt.title('Validation BLEU Score')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig('val_bleu_plot_'+ str(epoch) + '.png')
+        plt.show()
 
 def remove_consecutive_duplicates(lines):
     filtered_lines = []
