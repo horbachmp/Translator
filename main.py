@@ -1,4 +1,10 @@
 import sys
+import warnings
+
+# Отключение всех предупреждений
+# warnings.filterwarnings("ignore")
+############################################
+import matplotlib.pyplot as plt
 ############################################
 
 import torch
@@ -22,7 +28,7 @@ import random
 
 #parameters
 
-NUM_EPOCHS = 30
+NUM_EPOCHS = 20
 MIN_FREQENCY = 20
 
 torch.manual_seed(0)
@@ -37,6 +43,11 @@ BATCH_SIZE = 128
 NUM_ENCODER_LAYERS = 3
 NUM_DECODER_LAYERS = 3
 
+
+ADD_NOISE = True
+ADD_CROP = False
+
+
 ###################################################################
 
 
@@ -45,6 +56,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SOS_TOKEN_ENG = 2
 EOS_TOKEN_ENG = 3
 PAD_TOKEN_ENG = 0
+PAD_TOKEN_DE = 0
 
 # сделано на основе туториала
 # https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html
@@ -70,11 +82,13 @@ def create_tokenized_data(texts, vocab):
     return tokenized
 
 class NoiseDataset(TensorDataset):
-    def __init__(self, src_texts, tgt_texts, vocab_src, noise_level=0.1, p=0.1):
+    def __init__(self, src_texts, tgt_texts, vocab_src, noise_level=0.1, p_noise=0.1, crop_level=0.2, p_crop=0.1):
         self.src_texts = src_texts
         self.tgt_texts = tgt_texts
         self.noise_level = noise_level
-        self.p = p
+        self.p_noise = p_noise
+        self.p_crop = p_crop
+        self.crop_level = crop_level
         self.tokens = list(vocab_src.get_stoi().values())
         super().__init__()
 
@@ -87,11 +101,25 @@ class NoiseDataset(TensorDataset):
             text_tensor[index] = self.tokens[random.randint(0,len(self.tokens) - 1)]
         return text_tensor
 
+    def add_random_crop(self, text_tensor):
+        num_noise_chars = math.ceil(text_tensor.shape[0] * self.crop_level)
+        for _ in range(num_noise_chars):
+            index = random.randint(0, text_tensor.shape[0] - 1)
+            text_tensor = torch.cat((text_tensor[:index], text_tensor[index+1:], PAD_TOKEN_DE), dim=0)
+        return text_tensor
+
+
+    # def change_to_unk(self, text_tensor):
+
+
     def __getitem__(self, idx):
         src_text = self.src_texts[idx]
         tgt_text = self.tgt_texts[idx]
-        if random.random() < self.p:
-          src_text = self.add_noise_to_text(src_text)
+        
+        if ADD_NOISE and random.random() < self.p_noise:
+            src_text = self.add_noise_to_text(src_text)
+        if ADD_CROP and random.random() < self.p_crop:
+            src_text = self.add_random_crop(src_text)
 
         return src_text, tgt_text
 
@@ -304,29 +332,43 @@ def predict(dataloader, model, vocab_out):
 
 def train(train_dataloader, val_dataloader, val_answers, test_loader, model, optimizer, scheduler, criterion, n_epochs, vocab_out, vocab_in, print_every=5):
     print_loss_total = 0
-
+    losses = []
+    bleus = []
     for epoch in range(1, n_epochs + 1):
         print(epoch)
         loss = train_epoch(train_dataloader, model, optimizer, criterion)
+        losses.append(loss)
         print_loss_total += loss
         scheduler.step()
         if epoch % print_every == 0:
             print_loss_avg = print_loss_total / print_every
             print_loss_total = 0
             print("loss train:", print_loss_avg)
-            bleu = validate(val_dataloader, val_answers, model, vocab_out)
-            print("val bleu:", bleu)
+        bleu = validate(val_dataloader, val_answers, model, vocab_out)
+        print("val bleu:", bleu)
+        bleus.append(bleu)
 
         print(predict_one("vielen dank .", model, vocab_in, vocab_out))
         print("Predicting...")
         translates = predict(test_loader, model, vocab_out)
         translates = remove_consecutive_duplicates(translates)
         file_name = "answer" + str(epoch) +".txt"
-        with open(file_name, 'w') as answer_file:
+        with open(file_name, 'w', encoding="utf8") as answer_file:
             for line in translates:
                 answer_file.write(line + "\n")
         print("Predictions saved")
         torch.save(model.state_dict(), 'weights/model_' + str(epoch) +'.pt')
+    # Plotting and saving the graph
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(1, n_epochs + 1), losses, label='train Loss')
+    plt.plot(range(1, n_epochs + 1), bleus, label='val BLEU Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('Value')
+    plt.title('Training Loss and val BLEU Score')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_bleu_plot.png')
+    plt.show()
 
 def remove_consecutive_duplicates(lines):
     filtered_lines = []
@@ -378,6 +420,8 @@ def predict_one(sent, model, vocab_in, vocab_out):
 
 
 def main():
+    torch.cuda.empty_cache()
+
     print("Device:", device)
 
     print("Downloading data...")
@@ -390,11 +434,17 @@ def main():
         os.makedirs(extract_to_folder, exist_ok=True)
         with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
             zip_ref.extractall(extract_to_folder)
-    train_de = open('data/data/train.de-en.de').readlines()
-    train_en = open('data/data/train.de-en.en').readlines()
-    val_de = open('data/data/val.de-en.de').readlines()
-    val_en = open('data/data/val.de-en.en').readlines()
-    test_de = open('data/data/test1.de-en.de').readlines()
+    train_de = open('data/data/train.de-en.de', encoding="utf8").readlines()
+    train_en = open('data/data/train.de-en.en', encoding="utf8").readlines()
+    val_de = open('data/data/val.de-en.de', encoding="utf8").readlines()
+    val_en = open('data/data/val.de-en.en', encoding="utf8").readlines()
+    test_de = open('data/data/test1.de-en.de', encoding="utf8").readlines()
+
+    ## adding train to val
+    # train_de.extend(val_de)
+    # train_en.extend(val_en)
+
+
     print("Downloaded")
     print("Preparing data...")
     vocab_en = build_vocab_from_iterator(
@@ -408,6 +458,7 @@ def main():
     SOS_TOKEN_ENG = vocab_en['<sos>']
     EOS_TOKEN_ENG = vocab_en['<eos>']
     PAD_TOKEN_ENG = vocab_en['<pad>']
+    PAD_TOKEN_DE = vocab_de['<pad>']
     tokenized_train_de = create_tokenized_data(train_de, vocab_de)
     tokenized_train_en = create_tokenized_data(train_en, vocab_en)
     tokenized_val_de = create_tokenized_data(val_de, vocab_de)
@@ -436,7 +487,8 @@ def main():
 
     transformer = transformer.to(device)
 
-    optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0004, betas=(0.9, 0.98), eps=1e-9)
+    optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0004, betas=(0.9, 0.98), eps=1e-9, weight_decay=1e-6)
+    # optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0004, betas=(0.9, 0.98), eps=1e-9)
     scheduler = StepLR(optimizer, step_size=4, gamma=0.5)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ENG)
     if not os.path.exists("weights/"):
@@ -450,7 +502,7 @@ def main():
     print("Predicting...")
     translates = predict(test_loader, transformer, vocab_en)
     translates = remove_consecutive_duplicates(translates)
-    with open('final_answer.txt', 'w') as answer_file:
+    with open('final_answer.txt', 'w', encoding="utf8") as answer_file:
         for line in translates:
             answer_file.write(line + "\n")
     print("Predictions saved")
