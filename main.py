@@ -2,7 +2,7 @@ import sys
 import warnings
 
 # Отключение всех предупреждений
-# warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore")
 ############################################
 import matplotlib.pyplot as plt
 ############################################
@@ -24,12 +24,13 @@ import re
 import math
 from torch.utils.data import TensorDataset, DataLoader
 import random
+import heapq
 #################################################################
 
 #parameters
 
 NUM_EPOCHS = 20
-MIN_FREQENCY = 20
+MIN_FREQENCY = 2
 
 torch.manual_seed(0)
 
@@ -42,10 +43,6 @@ FFN_HID_DIM = 1024
 BATCH_SIZE = 128
 NUM_ENCODER_LAYERS = 3
 NUM_DECODER_LAYERS = 3
-
-
-ADD_NOISE = True
-ADD_CROP = False
 
 
 ###################################################################
@@ -105,7 +102,7 @@ class NoiseDataset(TensorDataset):
         num_noise_chars = math.ceil(text_tensor.shape[0] * self.crop_level)
         for _ in range(num_noise_chars):
             index = random.randint(0, text_tensor.shape[0] - 1)
-            text_tensor = torch.cat((text_tensor[:index], text_tensor[index+1:], PAD_TOKEN_DE), dim=0)
+            text_tensor = torch.cat((text_tensor[:index], text_tensor[index+1:], torch.Tensor([PAD_TOKEN_DE])), dim=0)
         return text_tensor
 
 
@@ -115,10 +112,9 @@ class NoiseDataset(TensorDataset):
     def __getitem__(self, idx):
         src_text = self.src_texts[idx]
         tgt_text = self.tgt_texts[idx]
-        
-        if ADD_NOISE and random.random() < self.p_noise:
+        if random.random() < self.p_noise:
             src_text = self.add_noise_to_text(src_text)
-        if ADD_CROP and random.random() < self.p_crop:
+        if src_text.shape[0] > 30 and random.random() < self.p_crop:
             src_text = self.add_random_crop(src_text)
 
         return src_text, tgt_text
@@ -233,8 +229,6 @@ def train_epoch(dataloader, model, optimizer, criterion):
 
         logits = model(src=input_tensor, trg=tgt_input, src_mask=src_mask, tgt_mask=tgt_mask,src_padding_mask = src_padding_mask, tgt_padding_mask=tgt_padding_mask, memory_key_padding_mask=src_padding_mask)
 
-#         print(torch.max(logits[0], dim = 1)[1])
-
         tgt_out = target_tensor[:, 1:]
         loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1).long())
         loss.backward()
@@ -254,7 +248,6 @@ def validate(dataloader, val_answers, model, vocab_out):
             input_tensor = input_tensor.to(device)
             target_tensor = target_tensor.to(device)
             lengths = torch.count_nonzero(input_tensor, dim=1)
-#             print("lengths", lengths.shape)
             src = input_tensor
             num_tokens = src.shape[1]
             src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool).to(device)
@@ -268,21 +261,14 @@ def validate(dataloader, val_answers, model, vocab_out):
                             .type(torch.bool)).to(device)
                 out = model.decode(ys, memory, tgt_mask)
                 prob = model.generator(out[:, -1])
-#                 print(prob.shape)
-#                 print(prob[0])
                 _, next_words = torch.max(prob, dim=1)
-#                 print(next_words.shape)
                 next_words = next_words.unsqueeze(0).transpose(0,1)
                 ys = torch.cat([ys, next_words], dim=1)
-#             print(ys)
-#             print(EOS_TOKEN_ENG)
-#             print(torch.sum(ys==EOS_TOKEN_ENG))
             i = 0
             for decoded_sent in ys:
                 decoded_words = []
                 for idx in decoded_sent[1:]:
                     if idx.item() == EOS_TOKEN_ENG:
-#                         print("hi")
                         break
                     decoded_words.append(vocab_out.lookup_token(idx.item()))
                 decoded_words_received.append(' '.join(decoded_words[:lengths[i]+5]))
@@ -358,8 +344,8 @@ def train(train_dataloader, val_dataloader, val_answers, test_loader, model, opt
                 answer_file.write(line + "\n")
         print("Predictions saved")
         torch.save(model.state_dict(), 'weights/model_' + str(epoch) +'.pt')
-        
-        # График для лосса
+    
+      # График для лосса
         plt.figure(figsize=(10, 5))
         plt.plot(range(1, epoch + 1), losses, label='Train Loss')
         plt.xlabel('Epoch')
@@ -368,7 +354,7 @@ def train(train_dataloader, val_dataloader, val_answers, test_loader, model, opt
         plt.legend()
         plt.grid(True)
         plt.savefig('train_loss_plot_'+ str(epoch) + '.png')
-        plt.show()
+        # plt.show()
 
         # График для BLEU Score
         plt.figure(figsize=(10, 5))
@@ -379,7 +365,7 @@ def train(train_dataloader, val_dataloader, val_answers, test_loader, model, opt
         plt.legend()
         plt.grid(True)
         plt.savefig('val_bleu_plot_'+ str(epoch) + '.png')
-        plt.show()
+        # plt.show()
 
 def remove_consecutive_duplicates(lines):
     filtered_lines = []
@@ -430,6 +416,125 @@ def predict_one(sent, model, vocab_in, vocab_out):
     return decoded_words_received
 
 
+def beam_predict_one(input_tensor, model, beam_width):
+    input_tensor = input_tensor.to(device)
+    src = input_tensor
+    num_tokens = src.shape[1]
+    src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool).to(device)
+    src_mask_pad = (src == PAD_TOKEN_ENG).type(torch.bool).to(device)
+    memory = model.encode(src, src_mask, src_mask_pad)
+
+    ys = torch.ones(src.shape[0], 1).fill_(SOS_TOKEN_ENG).type(torch.long).to(device)
+    options = []
+    heapq.heapify(options)
+
+    memory = memory.to(device)
+    tgt_mask = (generate_square_subsequent_mask(ys.size(1))
+                .type(torch.bool)).to(device)
+    out = model.decode(ys, memory, tgt_mask)
+    prob = torch.log(nn.functional.softmax(model.generator(out[:, -1]))[0])
+    probs, next_words = torch.topk(prob, k=beam_width, dim=0)
+    for i in range(beam_width):
+        heapq.heappush(options, (probs[i], torch.cat([ys, next_words[i].unsqueeze(0).unsqueeze(0)], dim=1).tolist()))
+    final_options = []
+    heapq.heapify(final_options)
+    for _ in range(MAX_LEN):
+        if len(options) == 0:
+          break
+        while len(options) > beam_width:
+            heapq.heappop(options)
+        while len(final_options) > beam_width:
+            heapq.heappop(final_options)
+        new_options = []
+        heapq.heapify(new_options)
+        for elem in options:
+            best_prob, best_seq = elem
+            best_seq = torch.tensor(best_seq, device=device)
+            tgt_mask = (generate_square_subsequent_mask(best_seq.size(1)).type(torch.bool)).to(device)
+            out = model.decode(best_seq, memory, tgt_mask)
+            prob = torch.log(nn.functional.softmax(model.generator(out[:, -1]))[0])
+            probs, next_words = torch.topk(prob, k=beam_width, dim=0)
+            for i in range(beam_width):
+                try:
+                    if next_words[i].item() == EOS_TOKEN_ENG:
+                        heapq.heappush(final_options, (probs[i] + best_prob, torch.cat([best_seq, next_words[i].unsqueeze(0).unsqueeze(0)], dim=1).tolist()))
+                    else:
+                        heapq.heappush(new_options, (probs[i] + best_prob, torch.cat([best_seq, next_words[i].unsqueeze(0).unsqueeze(0)], dim=1).tolist()))
+                except:
+                    pass
+                if len(options) > beam_width:
+                    heapq.heappop(options)
+                if len(final_options) > beam_width:
+                    heapq.heappop(final_options)
+        options = new_options
+    while len(options) > 0:
+        max_el = heapq.nlargest(1, options)[0]
+        options.remove(max_el)
+        heapq.heappush(final_options, max_el)
+    max_el = heapq.nlargest(1, final_options)[0]
+    best_prob, best_seq = max_el
+    return best_seq[0]
+
+def beam_validate(dataloader, val_answers, model, vocab_out, beam_width=2):
+    model.eval()
+    with torch.no_grad():
+        decoded_words_received = []
+        for data in tqdm(dataloader):
+            input_tensor, target_tensor = data
+            lengths = torch.count_nonzero(input_tensor, dim=1)
+            for batch_id in range(input_tensor.shape[0]):
+                curr_input_tensor = input_tensor[batch_id].unsqueeze(0).to(device)
+                ans = beam_predict_one(curr_input_tensor, model, beam_width)
+                decoded_words = []
+                for idx in ans[1:]:
+                    if idx == EOS_TOKEN_ENG:
+                        break
+                    decoded_words.append(vocab_out.lookup_token(idx))
+                decoded_words_received.append(' '.join(decoded_words[:lengths[batch_id]+5]))
+    print("Val example:")
+    i = random.randint(0, BATCH_SIZE - 3)
+    print("target:", val_answers[i][:-1])
+    print("received:", decoded_words_received[i])
+    bleu = sacrebleu.corpus_bleu(decoded_words_received, [val_answers]).score
+    return bleu
+
+def beam_predict_one_sent(sent, model, vocab_in, vocab_out, beam_width=3):
+    sent_tokens = create_tokenized_data([sent], vocab_in)
+    model.eval()
+    decoded_words_received = []
+    with torch.no_grad():
+        input_tensor = sent_tokens.clone()
+        input_tensor = input_tensor.to(device)
+        lengths = torch.count_nonzero(input_tensor, dim=1)
+        ans = beam_predict_one(input_tensor, model, beam_width)
+        decoded_words = []
+        for idx in ans[1:]:
+            if idx == EOS_TOKEN_ENG:
+                break
+            decoded_words.append(vocab_out.lookup_token(idx))
+        decoded_words_received.append(' '.join(decoded_words[:lengths[0] + 5]))
+    return decoded_words_received
+
+
+def beam_predict(dataloader, model, vocab_out, beam_width=2):
+    model.eval()
+    with torch.no_grad():
+        decoded_words_received = []
+        for data in tqdm(dataloader):
+            input_tensor = data[0]
+            lengths = torch.count_nonzero(input_tensor, dim=1)
+            for batch_id in range(input_tensor.shape[0]):
+                curr_input_tensor = input_tensor[batch_id].unsqueeze(0).to(device)
+                ans = beam_predict_one(curr_input_tensor, model, beam_width)
+                decoded_words = []
+                for idx in ans[1:]:
+                    if idx == EOS_TOKEN_ENG:
+                        break
+                    decoded_words.append(vocab_out.lookup_token(idx))
+                decoded_words_received.append(' '.join(decoded_words[:lengths[batch_id]+5]))
+    return decoded_words_received
+
+
 def main():
     torch.cuda.empty_cache()
 
@@ -440,11 +545,11 @@ def main():
         url = 'https://drive.google.com/uc?id=1_TGzGyCNcozHYUXPzniR9D4GGZbD43X2'
         output = 'data.zip'
         gdown.download(url, output, quiet=False)
-        zip_file_path = 'data.zip'
-        extract_to_folder = 'data'
-        os.makedirs(extract_to_folder, exist_ok=True)
-        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_to_folder)
+    zip_file_path = 'data.zip'
+    extract_to_folder = 'data'
+    os.makedirs(extract_to_folder, exist_ok=True)
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_to_folder)
     train_de = open('data/data/train.de-en.de', encoding="utf8").readlines()
     train_en = open('data/data/train.de-en.en', encoding="utf8").readlines()
     val_de = open('data/data/val.de-en.de', encoding="utf8").readlines()
@@ -499,8 +604,7 @@ def main():
     transformer = transformer.to(device)
 
     optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0004, betas=(0.9, 0.98), eps=1e-9, weight_decay=1e-6)
-    # optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0004, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = StepLR(optimizer, step_size=4, gamma=0.5)
+    scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ENG)
     if not os.path.exists("weights/"):
         os.makedirs("weights/")
