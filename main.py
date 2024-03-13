@@ -26,10 +26,6 @@ from train import *
 
 
 
-
-
-
-
 def main():
     torch.manual_seed(0)
     random.seed(42)
@@ -130,7 +126,8 @@ def main():
         file_name = "beam_answer_" + str(best_epoch) +".txt"
         with open(file_name, 'w', encoding="utf8") as answer_file:
             for line in preds:
-                answer_file.write(line + "\n")
+                cleaned_line = ' '.join(word for word in line.split() if word != '<unk>')
+                answer_file.write(cleaned_line + "\n")
         print("Predictions saved")
 
 main()
