@@ -10,7 +10,7 @@
  (данные будут загружены автоматически)
 
 
-
+-------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Implementation of a machine translator from German to English based on the Transformer architecture with beam search for improving predictions.
 
@@ -18,7 +18,7 @@ Achieves BLEU score of 28.34 on the test dataset.
 
 Usage:
 
-    In config.py, you can adjust parameters such as model size, dictionary and training parameters, as well as data augmentation settings.
+1. In config.py, you can adjust parameters such as model size, dictionary and training parameters, as well as data augmentation settings.
 
-    Run training followed by prediction generation: python main.py
-    (data will be loaded automatically)
+2. Run training followed by prediction generation: python main.py
+ (data will be loaded automatically)
