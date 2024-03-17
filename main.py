@@ -100,8 +100,8 @@ def main():
 
     optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
     # scheduler = StepLR(optimizer, step_size=5, gamma=0.8)
-    max_lr = 0.0004  # Максимальная скорость обучения
-    total_steps = len(train_loader) * NUM_EPOCHS  # Общее количество шагов обучения
+    max_lr = 0.0003  # Максимальная скорость обучения
+    total_steps = len(train_loader) * NUM_EPOCHS + 10 # Общее количество шагов обучения
     pct_start = 0.3  # Процент шагов для увеличения скорости обучения
     anneal_strategy = 'cos'  # Стратегия изменения скорости обучения (cosine)
 
